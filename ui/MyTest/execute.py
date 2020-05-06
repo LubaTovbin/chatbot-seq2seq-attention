@@ -1,0 +1,323 @@
+from sklearn.model_selection import train_test_split
+import unicodedata
+import re
+import numpy as np
+import os
+import io
+import time
+import numpy as np
+import tensorflow as tf
+import re
+import time
+import pandas as pd
+
+class Encoder(tf.keras.Model):
+    def __init__(self, vocab_size, embedding_dim, enc_units, batch_sz):
+        super(Encoder, self).__init__()
+        self.batch_sz = batch_sz
+        self.enc_units = enc_units
+        self.embedding = tf.keras.layers.Embedding(vocab_size, embedding_dim)
+        self.gru = tf.keras.layers.GRU(self.enc_units,
+                                       return_sequences=True,
+                                       return_state=True,
+                                       recurrent_initializer='glorot_uniform')
+
+    def call(self, x, hidden):
+        x = self.embedding(x)
+        output, state = self.gru(x, initial_state=hidden)
+        return output, state
+
+    def initialize_hidden_state(self):
+        return tf.zeros((self.batch_sz, self.enc_units))
+
+
+class Decoder(tf.keras.Model):
+    def __init__(self, vocab_size, embedding_dim, dec_units, batch_sz):
+        super(Decoder, self).__init__()
+        self.batch_sz = batch_sz
+        self.dec_units = dec_units
+        self.embedding = tf.keras.layers.Embedding(vocab_size, embedding_dim)
+        self.gru = tf.keras.layers.GRU(self.dec_units,
+                                       return_sequences=True,
+                                       return_state=True,
+                                       recurrent_initializer='glorot_uniform')
+        self.fc = tf.keras.layers.Dense(vocab_size)
+
+        # used for attention
+        self.attention = BahdanauAttention(self.dec_units)
+
+    def call(self, x, hidden, enc_output):
+        # enc_output shape == (batch_size, max_length, hidden_size)
+        context_vector, attention_weights = self.attention(hidden, enc_output)
+        # x shape after passing through embedding == (batch_size, 1, embedding_dim)
+        x = self.embedding(x)
+        # x shape after concatenation == (batch_size, 1, embedding_dim + hidden_size)
+        x = tf.concat([tf.expand_dims(context_vector, 1), x], axis=-1)
+        # passing the concatenated vector to the GRU
+        output, state = self.gru(x)
+        # output shape == (batch_size * 1, hidden_size)
+        output = tf.reshape(output, (-1, output.shape[2]))
+        # output shape == (batch_size, vocab)
+        x = self.fc(output)
+        return x, state, attention_weights
+
+class BahdanauAttention(tf.keras.layers.Layer):
+    def __init__(self, units):
+        super(BahdanauAttention, self).__init__()
+        self.W1 = tf.keras.layers.Dense(units)
+        self.W2 = tf.keras.layers.Dense(units)
+        self.V = tf.keras.layers.Dense(1)
+
+    def call(self, query, values):
+        # query hidden state shape == (batch_size, hidden size)
+        # query_with_time_axis shape == (batch_size, 1, hidden size)
+        # values shape == (batch_size, max_len, hidden size)
+        # we are doing this to broadcast addition along the time axis to calculate the score
+        query_with_time_axis = tf.expand_dims(query, 1)
+        # score shape == (batch_size, max_length, 1)
+        # we get 1 at the last axis because we are applying score to self.V
+        # the shape of the tensor before applying self.V is (batch_size, max_length, units)
+        score = self.V(tf.nn.tanh(
+            self.W1(query_with_time_axis) + self.W2(values)))
+        # attention_weights shape == (batch_size, max_length, 1)
+        attention_weights = tf.nn.softmax(score, axis=1)
+        # context_vector shape after sum == (batch_size, hidden_size)
+        context_vector = attention_weights * values
+        context_vector = tf.reduce_sum(context_vector, axis=1)
+        return context_vector, attention_weights
+
+
+class Test():
+    def __init__(self):
+        data = pd.read_csv('ui/MyTest/All-seasons.csv')
+        questions = []
+        answers = []
+
+        for i in range(0, data.shape[0] - 1):
+            if data.iloc[i + 1][2] == 'Stan':
+                questions.append(data.iloc[i][3])
+                answers.append(data.iloc[i + 1][3])
+
+        def preprocess_sentence(text):
+            text = text.lower()
+
+            text = re.sub(r"i'm", "i am", text)
+            text = re.sub(r"he's", "he is", text)
+            text = re.sub(r"she's", "she is", text)
+            text = re.sub(r"it's", "it is", text)
+            text = re.sub(r"that's", "that is", text)
+            text = re.sub(r"what's", "that is", text)
+            text = re.sub(r"where's", "where is", text)
+            text = re.sub(r"how's", "how is", text)
+            text = re.sub(r"\'ll", " will", text)
+            text = re.sub(r"\'ve", " have", text)
+            text = re.sub(r"\'re", " are", text)
+            text = re.sub(r"\'d", " would", text)
+            text = re.sub(r"\'re", " are", text)
+            text = re.sub(r"won't", "will not", text)
+            text = re.sub(r"can't", "cannot", text)
+            text = re.sub(r"n't", " not", text)
+            text = re.sub(r"n'", "ng", text)
+            text = re.sub(r"'bout", "about", text)
+            text = re.sub(r"'til", "until", text)
+            text = re.sub(r"  ", "", text)
+            text = re.sub(r"[-()\"#/@;:<>{}`+=~|.!?,]", "", text)
+
+            text = re.sub(r"([?.!,¿])", r" \1 ", text)
+            text = re.sub(r'[" "]+', " ", text)
+            text = re.sub(r"[^a-zA-Z?.!,¿]+", " ", text)
+
+            text = text.strip()
+            text = '<start> ' + text + ' <end>'
+            return text
+
+        clean_questions = []
+        clean_answers = []
+
+        for q in questions:
+            clean_questions.append(preprocess_sentence(q))
+        for a in answers:
+            clean_answers.append(preprocess_sentence(a))
+
+        max_length = 30
+        min_length = 1
+        short_questions_temp = []
+        short_answers_temp = []
+
+        i = 0
+        for question in clean_questions:
+            if len(question.split()) >= min_length and len(question.split()) <= max_length:
+                short_questions_temp.append(question)
+                short_answers_temp.append(clean_answers[i])
+            i += 1
+
+        # Filter out the answers that are too short/long
+        shorted_q = []
+        shorted_a = []
+
+        i = 0
+        for answer in short_answers_temp:
+            if len(answer.split()) >= min_length and len(answer.split()) <= max_length:
+                shorted_a.append(answer)
+                shorted_q.append(short_questions_temp[i])
+            i += 1
+
+        def tokenize(lang):
+            lang_tokenizer = tf.keras.preprocessing.text.Tokenizer(filters='')
+            lang_tokenizer.fit_on_texts(lang)
+
+            tensor = lang_tokenizer.texts_to_sequences(lang)
+
+            tensor = tf.keras.preprocessing.sequence.pad_sequences(tensor, padding='post')
+
+            return tensor, lang_tokenizer
+
+        def load_dataset(inp_lang, targ_lang):
+            # creating cleaned input, output pairs
+            input_tensor, inp_lang_tokenizer = tokenize(inp_lang)
+            target_tensor, targ_lang_tokenizer = tokenize(targ_lang)
+
+            return input_tensor, target_tensor, inp_lang_tokenizer, targ_lang_tokenizer
+
+        input_tensor, target_tensor, inp_lang, targ_lang = load_dataset(shorted_q, shorted_a)
+        # Creating training and validation sets using an 80-20 split
+        input_tensor_train, input_tensor_val, target_tensor_train, target_tensor_val = train_test_split(input_tensor,target_tensor, test_size=0.2)
+
+        # Show length
+        print(len(input_tensor_train), len(target_tensor_train), len(input_tensor_val), len(target_tensor_val))
+        self.max_length_targ, self.max_length_inp = target_tensor.shape[1], input_tensor.shape[1]
+        print(len(input_tensor_train), len(target_tensor_train), len(input_tensor_val), len(target_tensor_val))
+
+        def convert(lang, tensor):
+            for t in tensor:
+                if t != 0:
+                    print("%d ----> %s" % (t, lang.index_word[t]))
+
+
+        BUFFER_SIZE = len(input_tensor_train)
+        BATCH_SIZE = 64
+        steps_per_epoch = len(input_tensor_train) // BATCH_SIZE
+        embedding_dim = 256
+        units = 1024
+        vocab_inp_size = len(inp_lang.word_index) + 1
+        vocab_tar_size = len(targ_lang.word_index) + 1
+
+        dataset = tf.data.Dataset.from_tensor_slices((input_tensor_train, target_tensor_train)).shuffle(BUFFER_SIZE)
+        dataset = dataset.batch(BATCH_SIZE, drop_remainder=True)
+        example_input_batch, example_target_batch = next(iter(dataset))
+        print(example_input_batch)
+        example_input_batch_numpy = example_input_batch.numpy()
+        convert(inp_lang, example_input_batch_numpy[1])
+        example_input_batch.shape, example_target_batch.shape
+        encoder = Encoder(vocab_inp_size, embedding_dim, units, BATCH_SIZE)
+
+        # sample input
+        sample_hidden = encoder.initialize_hidden_state()
+        sample_output, sample_hidden = encoder(example_input_batch, sample_hidden)
+        print('Encoder output shape: (batch size, sequence length, units) {}'.format(sample_output.shape))
+        print('Encoder Hidden state shape: (batch size, units) {}'.format(sample_hidden.shape))
+        attention_layer = BahdanauAttention(10)
+        attention_result, attention_weights = attention_layer(sample_hidden, sample_output)
+        print("Attention result shape: (batch size, units) {}".format(attention_result.shape))
+        print("Attention weights shape: (batch_size, sequence_length, 1) {}".format(attention_weights.shape))
+        decoder = Decoder(vocab_tar_size, embedding_dim, units, BATCH_SIZE)
+        sample_decoder_output, _, _ = decoder(tf.random.uniform((BATCH_SIZE, 1)), sample_hidden, sample_output)
+        print('Decoder output shape: (batch_size, vocab size) {}'.format(sample_decoder_output.shape))
+        optimizer = tf.keras.optimizers.Adam()
+        loss_object = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
+
+        def loss_function(real, pred):
+            mask = tf.math.logical_not(tf.math.equal(real, 0))
+            loss_ = loss_object(real, pred)
+            mask = tf.cast(mask, dtype=loss_.dtype)
+            loss_ *= mask
+            return tf.reduce_mean(loss_)
+
+        self.checkpoint_dir = './nmt_with_attention_southpark/training_checkpoints/'
+        checkpoint_prefix = os.path.join(self.checkpoint_dir, "ckpt")
+        self.checkpoint = tf.train.Checkpoint(optimizer=optimizer, encoder=encoder, decoder=decoder)
+        self.inp_lang = inp_lang
+        self.units = units
+        self.encoder = encoder
+        self.targ_lang = targ_lang
+        self.decoder = decoder
+
+
+    def preprocess_sentence(self, text):
+        text = text.lower()
+
+        text = re.sub(r"i'm", "i am", text)
+        text = re.sub(r"he's", "he is", text)
+        text = re.sub(r"she's", "she is", text)
+        text = re.sub(r"it's", "it is", text)
+        text = re.sub(r"that's", "that is", text)
+        text = re.sub(r"what's", "that is", text)
+        text = re.sub(r"where's", "where is", text)
+        text = re.sub(r"how's", "how is", text)
+        text = re.sub(r"\'ll", " will", text)
+        text = re.sub(r"\'ve", " have", text)
+        text = re.sub(r"\'re", " are", text)
+        text = re.sub(r"\'d", " would", text)
+        text = re.sub(r"\'re", " are", text)
+        text = re.sub(r"won't", "will not", text)
+        text = re.sub(r"can't", "cannot", text)
+        text = re.sub(r"n't", " not", text)
+        text = re.sub(r"n'", "ng", text)
+        text = re.sub(r"'bout", "about", text)
+        text = re.sub(r"'til", "until", text)
+        text = re.sub(r"  ", "", text)
+        text = re.sub(r"[-()\"#/@;:<>{}`+=~|.!?,]", "", text)
+
+        text = re.sub(r"([?.!,¿])", r" \1 ", text)
+        text = re.sub(r'[" "]+', " ", text)
+        text = re.sub(r"[^a-zA-Z?.!,¿]+", " ", text)
+
+        text = text.strip()
+        text = '<start> ' + text + ' <end>'
+        return text
+
+    def unicode_to_ascii(self, s):
+        return ''.join(c for c in unicodedata.normalize('NFD', s)
+                       if unicodedata.category(c) != 'Mn')
+
+
+
+    def evaluate(self, sentence):
+        attention_plot = np.zeros((self.max_length_targ, self.max_length_inp))
+        sentence = self.preprocess_sentence(sentence)
+        print(type(self.inp_lang))
+        inputs = [self.inp_lang.word_index[i] for i in sentence.split(' ')]
+        inputs = tf.keras.preprocessing.sequence.pad_sequences([inputs], maxlen=self.max_length_inp, padding='post')
+        inputs = tf.convert_to_tensor(inputs)
+        result = ''
+        hidden = [tf.zeros((1, self.units))]
+        enc_out, enc_hidden = self.encoder(inputs, hidden)
+
+        dec_hidden = enc_hidden
+        dec_input = tf.expand_dims([self.targ_lang.word_index['<start>']], 0)
+
+        for t in range(self.max_length_targ):
+            predictions, dec_hidden, attention_weights = self.decoder(dec_input, dec_hidden, enc_out)
+            # storing the attention weights to plot later on
+            attention_weights = tf.reshape(attention_weights, (-1,))
+            attention_plot[t] = attention_weights.numpy()
+            predicted_id = tf.argmax(predictions[0]).numpy()
+            result += self.targ_lang.index_word[predicted_id] + ' '
+            if self.targ_lang.index_word[predicted_id] == '<end>':
+                return result, sentence, attention_plot
+            # the predicted ID is fed back into the model
+            dec_input = tf.expand_dims([predicted_id], 0)
+        return result, sentence, attention_plot
+
+    def translate(self, sentence):
+        result, sentence, attention_plot = self.evaluate(sentence)
+        print('Input: %s' % (sentence))
+        print('Predicted translation: {}'.format(result))
+        return result
+        # attention_plot = attention_plot[:len(result.split(' ')), :len(sentence.split(' '))]
+        # plot_attention(attention_plot, sentence.split(' '), result.split(' '))
+
+    def decode_line(self, sentense):
+        print(self.checkpoint_dir)
+        self.checkpoint.restore(tf.train.latest_checkpoint(self.checkpoint_dir))
+        return self.translate(sentense)
